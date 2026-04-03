@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "legendary-chainsaw"
+version = "0.1.0"
+description = "Autonomous options trading platform"
+requires-python = ">=3.11"
+dependencies = [
+    "ib_insync>=0.9.86",
+    "polygon-api-client>=1.12.0",
+    "pandas>=2.1.0",
+    "numpy>=1.25.0",
+    "scipy>=1.11.0",
+    "py_vollib>=1.0.1",
+    "quantlib>=1.31",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "sqlalchemy>=2.0.0",
+    "apscheduler>=3.10.0",
+    "structlog>=23.2.0",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

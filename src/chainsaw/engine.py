@@ -8,6 +8,7 @@ from datetime import datetime
 from chainsaw.broker.base import Broker
 from chainsaw.logging import get_logger
 from chainsaw.models import OrderStatus
+from chainsaw.monitor.dashboard import PortfolioDashboard
 from chainsaw.risk.manager import RiskManager
 from chainsaw.strategy.base import Signal, SignalType, Strategy
 
@@ -23,11 +24,16 @@ class TradingEngine:
         risk_manager: RiskManager,
         strategies: list[Strategy],
         tick_interval: float = 60.0,
+        dashboard: PortfolioDashboard | None = None,
+        status_interval: int = 10,
     ) -> None:
         self.broker = broker
         self.risk = risk_manager
         self.strategies = strategies
         self.tick_interval = tick_interval
+        self.dashboard = dashboard or PortfolioDashboard()
+        self._status_interval = status_interval
+        self._tick_count = 0
         self._running = False
 
     async def start(self) -> None:
@@ -63,7 +69,16 @@ class TradingEngine:
             await asyncio.sleep(self.tick_interval)
 
     async def _tick(self) -> None:
+        self._tick_count += 1
         portfolio = await self.broker.get_portfolio()
+
+        # Record snapshot for monitoring
+        self.dashboard.record_snapshot(portfolio)
+
+        # Print status periodically
+        if self._tick_count % self._status_interval == 0:
+            status = self.dashboard.format_status(portfolio)
+            log.info("portfolio_status", status=f"\n{status}")
 
         # Monitor portfolio risk
         risk_status = self.risk.monitor_portfolio(portfolio)

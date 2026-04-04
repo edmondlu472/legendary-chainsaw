@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from chainsaw.broker.base import Broker
 from chainsaw.data.provider import MarketDataProvider
@@ -16,6 +16,7 @@ from chainsaw.models import (
     Side,
 )
 from chainsaw.pricing.engine import PricingEngine
+from chainsaw.signals.composite import CompositeSignalGenerator
 from chainsaw.strategy.base import Signal, SignalType, Strategy
 
 log = get_logger(__name__)
@@ -47,6 +48,8 @@ class IronCondorStrategy(Strategy):
         min_credit: float = 0.50,
         max_risk_per_trade: float = 500.0,
         min_iv_rank: float = 30.0,
+        signal_generator: CompositeSignalGenerator | None = None,
+        lookback_days: int = 252,
     ) -> None:
         super().__init__(name="iron_condor")
         self.symbols = symbols
@@ -61,6 +64,8 @@ class IronCondorStrategy(Strategy):
         self.min_credit = min_credit
         self.max_risk_per_trade = max_risk_per_trade
         self.min_iv_rank = min_iv_rank
+        self.signals = signal_generator or CompositeSignalGenerator(min_iv_rank_for_selling=min_iv_rank)
+        self.lookback_days = lookback_days
 
     async def evaluate(self, portfolio: PortfolioSnapshot) -> Signal:
         for symbol in self.symbols:
@@ -86,10 +91,24 @@ class IronCondorStrategy(Strategy):
         if not chain:
             return Signal(signal_type=SignalType.HOLD, reason="Empty chain")
 
-        # Check IV rank (placeholder — needs historical IV data)
+        # Get IV history for rank/percentile calculation
         avg_iv = self._avg_chain_iv(chain)
-        if avg_iv < self.min_iv_rank / 100:
-            return Signal(signal_type=SignalType.HOLD, reason=f"IV too low ({avg_iv:.1%})")
+        try:
+            end = date.today()
+            start = end - timedelta(days=self.lookback_days)
+            iv_history = await self.data.get_iv_history(symbol, start, end)
+            if not iv_history.empty and "close" in iv_history.columns:
+                iv_series = iv_history["close"]
+                if not self.signals.should_sell_premium(avg_iv, iv_series):
+                    return Signal(signal_type=SignalType.HOLD, reason=f"{symbol}: IV rank too low for premium selling")
+            else:
+                # Fallback: use chain IV directly
+                if avg_iv < self.min_iv_rank / 100:
+                    return Signal(signal_type=SignalType.HOLD, reason=f"IV too low ({avg_iv:.1%})")
+        except Exception as e:
+            log.warning("iv_history_unavailable", symbol=symbol, error=str(e))
+            if avg_iv < self.min_iv_rank / 100:
+                return Signal(signal_type=SignalType.HOLD, reason=f"IV too low ({avg_iv:.1%})")
 
         orders = self._build_iron_condor(symbol, quote.last, target_exp, chain)
         if not orders:

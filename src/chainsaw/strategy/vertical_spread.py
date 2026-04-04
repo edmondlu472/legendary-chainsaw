@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from chainsaw.broker.base import Broker
 from chainsaw.data.provider import MarketDataProvider
@@ -17,6 +17,7 @@ from chainsaw.models import (
     Side,
 )
 from chainsaw.pricing.engine import PricingEngine
+from chainsaw.signals.composite import CompositeSignalGenerator
 from chainsaw.strategy.base import Signal, SignalType, Strategy
 
 log = get_logger(__name__)
@@ -40,6 +41,9 @@ class VerticalSpreadStrategy(Strategy):
         spread_width: float = 5.0,
         min_iv_percentile: float = 0.3,
         max_risk_per_trade: float = 500.0,
+        signal_generator: CompositeSignalGenerator | None = None,
+        min_signal_strength: float = 0.25,
+        lookback_days: int = 60,
     ) -> None:
         super().__init__(name="vertical_spread")
         self.symbols = symbols
@@ -51,6 +55,9 @@ class VerticalSpreadStrategy(Strategy):
         self.spread_width = spread_width
         self.min_iv_percentile = min_iv_percentile
         self.max_risk_per_trade = max_risk_per_trade
+        self.signals = signal_generator or CompositeSignalGenerator()
+        self.min_signal_strength = min_signal_strength
+        self.lookback_days = lookback_days
 
     async def evaluate(self, portfolio: PortfolioSnapshot) -> Signal:
         for symbol in self.symbols:
@@ -78,11 +85,26 @@ class VerticalSpreadStrategy(Strategy):
         if not chain:
             return Signal(signal_type=SignalType.HOLD, reason=f"Empty chain for {symbol}")
 
-        # Simple directional signal: bullish if price above short-term midpoint
-        # This is a placeholder — replace with real signal logic
-        direction = self._get_direction_signal(quote.last)
-        if direction is None:
-            return Signal(signal_type=SignalType.HOLD, reason="No directional signal")
+        # Get historical prices for signal generation
+        try:
+            end = date.today()
+            start = end - timedelta(days=self.lookback_days)
+            price_history = await self.data.get_stock_history(symbol, start, end)
+            if price_history.empty or len(price_history) < 30:
+                return Signal(signal_type=SignalType.HOLD, reason=f"Insufficient price history for {symbol}")
+            prices = price_history["close"]
+        except Exception as e:
+            log.warning("history_fetch_failed", symbol=symbol, error=str(e))
+            return Signal(signal_type=SignalType.HOLD, reason=f"Price history unavailable for {symbol}")
+
+        # Generate composite signal
+        avg_iv = self._avg_chain_iv(chain)
+        signal_output = self.signals.generate(prices, current_iv=avg_iv)
+
+        if signal_output.direction == "neutral" or signal_output.strength < self.min_signal_strength:
+            return Signal(signal_type=SignalType.HOLD, reason=f"{symbol}: {signal_output.rationale}")
+
+        direction = signal_output.direction
 
         # Build the spread
         orders = self._build_spread(symbol, quote.last, target_exp, chain, direction)
@@ -92,8 +114,8 @@ class VerticalSpreadStrategy(Strategy):
         return Signal(
             signal_type=SignalType.OPEN,
             orders=orders,
-            reason=f"{'Bull call' if direction == 'bull' else 'Bear put'} spread on {symbol}",
-            confidence=0.6,
+            reason=f"{'Bull call' if direction == 'bull' else 'Bear put'} spread on {symbol} ({signal_output.rationale})",
+            confidence=signal_output.strength,
         )
 
     def _select_expiration(self, expirations: list[date]) -> date | None:
@@ -104,10 +126,9 @@ class VerticalSpreadStrategy(Strategy):
                 return exp
         return None
 
-    def _get_direction_signal(self, price: float) -> str | None:
-        """Placeholder directional signal. Replace with real analysis."""
-        # TODO: Implement actual signal logic (momentum, mean reversion, etc.)
-        return "bull"
+    def _avg_chain_iv(self, chain: list[OptionQuote]) -> float:
+        ivs = [q.greeks.iv for q in chain if q.greeks.iv > 0]
+        return sum(ivs) / len(ivs) if ivs else 0.0
 
     def _build_spread(
         self,

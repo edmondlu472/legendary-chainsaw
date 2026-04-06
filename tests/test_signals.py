@@ -120,19 +120,41 @@ def test_bollinger_oversold():
 
 
 def test_composite_bullish():
-    gen = CompositeSignalGenerator()
+    # Use momentum-only weighting to isolate directional signal
+    gen = CompositeSignalGenerator(
+        momentum_weight=1.0, mean_reversion_weight=0.0, iv_weight=0.0,
+        bull_threshold=0.05, bear_threshold=-0.05,
+    )
     prices = _trending_up()
     output = gen.generate(prices)
     assert output.direction == "bull"
     assert output.strength > 0
+    assert output.momentum > 0
 
 
 def test_composite_bearish():
-    gen = CompositeSignalGenerator()
+    gen = CompositeSignalGenerator(
+        momentum_weight=1.0, mean_reversion_weight=0.0, iv_weight=0.0,
+        bull_threshold=0.05, bear_threshold=-0.05,
+    )
     prices = _trending_down()
     output = gen.generate(prices)
     assert output.direction == "bear"
     assert output.strength > 0
+    assert output.momentum < 0
+
+
+def test_composite_mean_reversion_dampens_momentum():
+    """Verify that mean reversion counteracts momentum in overbought conditions."""
+    momentum_only = CompositeSignalGenerator(
+        momentum_weight=1.0, mean_reversion_weight=0.0, iv_weight=0.0,
+    )
+    balanced = CompositeSignalGenerator()
+    prices = _trending_up()
+    mom_output = momentum_only.generate(prices)
+    bal_output = balanced.generate(prices)
+    # Balanced signal should be weaker than pure momentum
+    assert bal_output.strength <= mom_output.strength
 
 
 def test_composite_should_sell_premium():

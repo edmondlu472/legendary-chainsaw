@@ -1,4 +1,4 @@
-"""Options pricing engine using Black-Scholes and py_vollib."""
+"""Options pricing engine using Black-Scholes (pure scipy implementation)."""
 
 from __future__ import annotations
 
@@ -7,13 +7,6 @@ from dataclasses import dataclass
 from datetime import date
 
 from scipy.stats import norm
-from py_vollib.black_scholes import black_scholes as bs_price
-from py_vollib.black_scholes.greeks.analytical import delta as bs_delta
-from py_vollib.black_scholes.greeks.analytical import gamma as bs_gamma
-from py_vollib.black_scholes.greeks.analytical import theta as bs_theta
-from py_vollib.black_scholes.greeks.analytical import vega as bs_vega
-from py_vollib.black_scholes.greeks.analytical import rho as bs_rho
-from py_vollib.black_scholes.implied_volatility import implied_volatility as bs_iv
 
 from chainsaw.models import Greeks, OptionContract, OptionType
 
@@ -25,8 +18,70 @@ class PricingResult:
     iv: float
 
 
+def _d1(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    return (math.log(s / k) + (r + 0.5 * sigma**2) * t) / (sigma * math.sqrt(t))
+
+
+def _d2(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    return _d1(s, k, t, r, sigma) - sigma * math.sqrt(t)
+
+
+def _bs_call_price(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    d2 = _d2(s, k, t, r, sigma)
+    return s * norm.cdf(d1) - k * math.exp(-r * t) * norm.cdf(d2)
+
+
+def _bs_put_price(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    d2 = _d2(s, k, t, r, sigma)
+    return k * math.exp(-r * t) * norm.cdf(-d2) - s * norm.cdf(-d1)
+
+
+def _bs_price(flag: str, s: float, k: float, t: float, r: float, sigma: float) -> float:
+    if flag == "c":
+        return _bs_call_price(s, k, t, r, sigma)
+    return _bs_put_price(s, k, t, r, sigma)
+
+
+def _bs_delta(flag: str, s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    if flag == "c":
+        return norm.cdf(d1)
+    return norm.cdf(d1) - 1
+
+
+def _bs_gamma(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    return norm.pdf(d1) / (s * sigma * math.sqrt(t))
+
+
+def _bs_theta(flag: str, s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    d2 = _d2(s, k, t, r, sigma)
+    term1 = -(s * norm.pdf(d1) * sigma) / (2 * math.sqrt(t))
+    if flag == "c":
+        return (term1 - r * k * math.exp(-r * t) * norm.cdf(d2)) / 365
+    return (term1 + r * k * math.exp(-r * t) * norm.cdf(-d2)) / 365
+
+
+def _bs_vega(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d1 = _d1(s, k, t, r, sigma)
+    return s * norm.pdf(d1) * math.sqrt(t) / 100  # Per 1% vol move
+
+
+def _bs_rho(flag: str, s: float, k: float, t: float, r: float, sigma: float) -> float:
+    d2 = _d2(s, k, t, r, sigma)
+    if flag == "c":
+        return k * t * math.exp(-r * t) * norm.cdf(d2) / 100
+    return -k * t * math.exp(-r * t) * norm.cdf(-d2) / 100
+
+
 class PricingEngine:
-    """Compute option prices, Greeks, and implied volatility."""
+    """Compute option prices, Greeks, and implied volatility.
+
+    Pure scipy implementation — no external options libraries required.
+    """
 
     def __init__(self, risk_free_rate: float = 0.05) -> None:
         self.risk_free_rate = risk_free_rate
@@ -44,7 +99,6 @@ class PricingEngine:
         flag = "c" if contract.option_type == OptionType.CALL else "p"
 
         if t <= 0:
-            # Expired — return intrinsic value
             intrinsic = self._intrinsic(contract, spot)
             return PricingResult(
                 theoretical_price=intrinsic,
@@ -54,13 +108,13 @@ class PricingEngine:
                 iv=0.0,
             )
 
-        price = bs_price(flag, spot, contract.strike, t, r, iv)
+        price = _bs_price(flag, spot, contract.strike, t, r, iv)
         greeks = Greeks(
-            delta=bs_delta(flag, spot, contract.strike, t, r, iv),
-            gamma=bs_gamma(flag, spot, contract.strike, t, r, iv),
-            theta=bs_theta(flag, spot, contract.strike, t, r, iv),
-            vega=bs_vega(flag, spot, contract.strike, t, r, iv),
-            rho=bs_rho(flag, spot, contract.strike, t, r, iv),
+            delta=_bs_delta(flag, spot, contract.strike, t, r, iv),
+            gamma=_bs_gamma(spot, contract.strike, t, r, iv),
+            theta=_bs_theta(flag, spot, contract.strike, t, r, iv),
+            vega=_bs_vega(spot, contract.strike, t, r, iv),
+            rho=_bs_rho(flag, spot, contract.strike, t, r, iv),
             iv=iv,
         )
 
@@ -73,7 +127,7 @@ class PricingEngine:
         market_price: float,
         rate: float | None = None,
     ) -> float:
-        """Compute implied volatility from market price."""
+        """Compute implied volatility from market price using bisection."""
         r = rate or self.risk_free_rate
         t = self._time_to_expiry(contract.expiration)
         flag = "c" if contract.option_type == OptionType.CALL else "p"
@@ -81,10 +135,7 @@ class PricingEngine:
         if t <= 0 or market_price <= 0:
             return 0.0
 
-        try:
-            return bs_iv(market_price, spot, contract.strike, t, r, flag)
-        except Exception:
-            return self._iv_bisection(flag, spot, contract.strike, t, r, market_price)
+        return self._iv_bisection(flag, spot, contract.strike, t, r, market_price)
 
     def spread_price(
         self,
@@ -120,11 +171,11 @@ class PricingEngine:
         tol: float = 1e-6,
         max_iter: int = 100,
     ) -> float:
-        """Fallback bisection method for IV when Newton's method fails."""
+        """Bisection method for implied volatility."""
         low, high = 0.001, 5.0
         for _ in range(max_iter):
             mid = (low + high) / 2
-            price = bs_price(flag, spot, strike, t, r, mid)
+            price = _bs_price(flag, spot, strike, t, r, mid)
             if abs(price - target_price) < tol:
                 return mid
             if price > target_price:

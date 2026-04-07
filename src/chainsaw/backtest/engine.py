@@ -121,9 +121,14 @@ class SpreadPosition:
         return self.pnl_pct_of_max >= self.take_profit_pct
 
     def should_stop_loss(self) -> bool:
-        if self.max_loss > 0:
-            loss_pct = -self.unrealized_pnl / self.max_loss
-            return loss_pct >= self.stop_loss_pct
+        """Stop loss based on multiples of max_profit (credit received for credit spreads).
+
+        For credit spread: stop_loss_pct=2.0 means close when loss = 2x credit.
+        For debit spread: stop_loss_pct=0.8 means close when loss = 80% of cost.
+        """
+        if self.max_profit > 0 and self.unrealized_pnl < 0:
+            loss_multiple = -self.unrealized_pnl / self.max_profit
+            return loss_multiple >= self.stop_loss_pct
         return False
 
     def is_expired(self, current_date) -> bool:

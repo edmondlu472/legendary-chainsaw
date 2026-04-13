@@ -113,9 +113,9 @@ class AdaptiveCreditSpread(Strategy):
     """
 
     def __init__(self, pricing: PricingEngine, wing_width: float = 10.0,
-                 target_dte: int = 21, base_risk_pct: float = 0.015,
-                 min_iv_rank: float = 30.0, max_open: int = 5,
-                 cooldown: int = 4) -> None:
+                 target_dte: int = 30, base_risk_pct: float = 0.025,
+                 min_iv_rank: float = 60.0, max_open: int = 3,
+                 cooldown: int = 12) -> None:
         super().__init__(name="adaptive_credit")
         self.pricing = pricing
         self.wing_width = wing_width
@@ -159,27 +159,29 @@ class AdaptiveCreditSpread(Strategy):
         std = spot * vol_mult * np.sqrt(self.target_dte / 365)
         otm_factor = 1.2 + max(0, vol_mult - 0.18) * 3  # 1.2 at 18% vol, 1.8 at 38%
 
-        if ts >= 0.2:
+        # Require a defined trend — no neutral sales. In high vol, demand stronger confluence.
+        min_trend = 0.4 if rvol < 0.22 else 0.8
+        if abs(ts) < min_trend:
+            return Signal(signal_type=SignalType.HOLD, reason=f"Weak trend ({ts:.1f})")
+
+        # Skip if realized vol is extreme — strikes will get blown through
+        if rvol > 0.28:
+            return Signal(signal_type=SignalType.HOLD, reason=f"Vol too high ({rvol:.0%})")
+
+        if ts > 0:
             # Uptrend: sell put spread
             short_k = round((spot - std * otm_factor) / 5) * 5
             long_k = short_k - self.wing_width
             short_c = OptionContract("SPY", exp, short_k, OptionType.PUT)
             long_c = OptionContract("SPY", exp, long_k, OptionType.PUT)
             desc = f"bull put (trend={ts:.1f})"
-        elif ts <= -0.2:
+        else:
             # Downtrend: sell call spread
             short_k = round((spot + std * otm_factor) / 5) * 5
             long_k = short_k + self.wing_width
             short_c = OptionContract("SPY", exp, short_k, OptionType.CALL)
             long_c = OptionContract("SPY", exp, long_k, OptionType.CALL)
             desc = f"bear call (trend={ts:.1f})"
-        else:
-            # Neutral: defensive put spread, extra OTM
-            short_k = round((spot - std * (otm_factor + 0.3)) / 5) * 5
-            long_k = short_k - self.wing_width
-            short_c = OptionContract("SPY", exp, short_k, OptionType.PUT)
-            long_c = OptionContract("SPY", exp, long_k, OptionType.PUT)
-            desc = f"neutral put (trend={ts:.1f})"
 
         sp = self.pricing.price(short_c, spot, cur_iv)
         lp = self.pricing.price(long_c, spot, cur_iv)
@@ -190,7 +192,7 @@ class AdaptiveCreditSpread(Strategy):
 
         max_loss = (self.wing_width - credit) * 100
         vol_scale = max(0.5, min(1.0, 0.20 / rvol))
-        qty = max(1, min(int(portfolio.net_liquidation * self.base_risk_pct * vol_scale / max_loss), 5))
+        qty = max(1, min(int(portfolio.net_liquidation * self.base_risk_pct * vol_scale / max_loss), 10))
 
         orders = [
             Order(contract=long_c, side=Side.BUY, quantity=qty,
@@ -203,7 +205,7 @@ class AdaptiveCreditSpread(Strategy):
         sig = Signal(signal_type=SignalType.OPEN, orders=orders,
                      reason=f"{desc} IVR:{ivr:.0f}", confidence=0.5)
         sig._take_profit_pct = 0.50
-        sig._stop_loss_pct = 2.0  # Close when loss = 2x credit received
+        sig._stop_loss_pct = 1.5  # Tighter stop — cut losers before they compound
         return sig
 
     async def on_fill(self, order: Order) -> None:
@@ -227,9 +229,9 @@ class TrendDebitSpread(Strategy):
     - Realized vol is not extreme (avoids whipsaw regimes)
     """
 
-    def __init__(self, pricing: PricingEngine, spread_width: float = 5.0,
-                 target_dte: int = 21, base_risk_pct: float = 0.012,
-                 max_open: int = 4, cooldown: int = 5) -> None:
+    def __init__(self, pricing: PricingEngine, spread_width: float = 10.0,
+                 target_dte: int = 35, base_risk_pct: float = 0.025,
+                 max_open: int = 3, cooldown: int = 10) -> None:
         super().__init__(name="trend_debit")
         self.pricing = pricing
         self.spread_width = spread_width
@@ -257,18 +259,24 @@ class TrendDebitSpread(Strategy):
         ts = trend_score(prices)
         rvol = realized_vol(prices)
 
-        # Only trade strong, confirmed trends
-        if abs(ts) < 0.6:
+        # Only trade strong, confirmed trends (0.8 = full MA confluence)
+        if abs(ts) < 0.8:
             return Signal(signal_type=SignalType.HOLD, reason=f"Weak trend ({ts:.1f})")
 
         # Skip extreme vol regimes (whipsaws destroy debit spreads)
-        if rvol > 0.35:
+        if rvol > 0.30:
             return Signal(signal_type=SignalType.HOLD, reason=f"Vol too high ({rvol:.0%})")
 
-        # RSI filter
+        # RSI filter — plus momentum confluence (20-day return must agree with trend)
         current_rsi = rsi(prices, 14).iloc[-1]
         if np.isnan(current_rsi):
             return Signal(signal_type=SignalType.HOLD)
+
+        ret_20 = (prices.iloc[-1] / prices.iloc[-20] - 1) if len(prices) >= 20 else 0
+        if ts > 0 and ret_20 <= 0:
+            return Signal(signal_type=SignalType.HOLD, reason="Momentum disagrees")
+        if ts < 0 and ret_20 >= 0:
+            return Signal(signal_type=SignalType.HOLD, reason="Momentum disagrees")
 
         exp = date.today() + timedelta(days=self.target_dte)
 
@@ -298,7 +306,7 @@ class TrendDebitSpread(Strategy):
 
         vol_scale = max(0.5, min(1.0, 0.22 / rvol))
         risk = portfolio.net_liquidation * self.base_risk_pct * vol_scale
-        qty = max(1, min(int(risk / (cost * 100)), 5))
+        qty = max(1, min(int(risk / (cost * 100)), 10))
 
         orders = [
             Order(contract=long_c, side=Side.BUY, quantity=qty,
@@ -311,8 +319,8 @@ class TrendDebitSpread(Strategy):
         sig = Signal(signal_type=SignalType.OPEN, orders=orders,
                      reason=f"{'Bull' if direction == 'bull' else 'Bear'} debit (trend={ts:.1f}, RSI={current_rsi:.0f})",
                      confidence=abs(ts))
-        sig._take_profit_pct = 0.40
-        sig._stop_loss_pct = 1.5  # Close when loss = 1.5x max profit potential
+        sig._take_profit_pct = 0.60  # Let winners run (stronger trends = bigger moves)
+        sig._stop_loss_pct = 1.2     # Tight stop — if trend breaks, exit fast
         return sig
 
     async def on_fill(self, order: Order) -> None:
@@ -413,8 +421,8 @@ def run_backtest():
             "Adaptive Credit": lambda: AdaptiveCreditSpread(pricing),
             "Trend Debit": lambda: TrendDebitSpread(pricing),
             "Combined": lambda: CombinedStrategy(
-                AdaptiveCreditSpread(pricing, base_risk_pct=0.01),
-                TrendDebitSpread(pricing, base_risk_pct=0.008),
+                AdaptiveCreditSpread(pricing, base_risk_pct=0.018),
+                TrendDebitSpread(pricing, base_risk_pct=0.018),
             ),
         }
 
